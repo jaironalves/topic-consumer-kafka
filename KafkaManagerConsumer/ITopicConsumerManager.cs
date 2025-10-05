@@ -1,9 +1,9 @@
 ﻿
 namespace KafkaManagerConsumer
 {
-    public interface IKafkaConsumerManager<TKey, TValue>
+    public interface ITopicConsumerManager<TKey, TValue>
     {
-        void Start();
-        Task StopAsync();
+        Task ExecuteAsync(CancellationToken cancellationToken);
+        Task StopAsync(CancellationToken cancellationToken);
     }
 }

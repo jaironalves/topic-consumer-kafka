@@ -1,10 +1,5 @@
 ﻿using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace KafkaManagerConsumer
 {
@@ -18,10 +13,13 @@ namespace KafkaManagerConsumer
         private readonly int _batchSize;
         private readonly TimeSpan _batchTimeout;
 
-        private CancellationTokenSource? _cts;
-        private Task? _runningTask;
+        private Task? _consumerTask;
+        private CancellationTokenSource? _stoppingCts;
 
-        // Estado visível ao manager
+        public virtual Task? ConsumerTask => _consumerTask;
+
+        public bool Actived { get; private set; } = false;
+        public bool FirstConsumeFailed { get; private set; } = false;
         public int PartitionCount { get; private set; }
         public DateTime LastPartitionAssigned { get; private set; } = DateTime.UtcNow;
 
@@ -44,29 +42,97 @@ namespace KafkaManagerConsumer
         }
 
         // Inicia o loop e devolve a Task para o manager poder aguardar se quiser
-        public Task StartAsync(CancellationToken managerToken)
+        public Task StartAsync(CancellationToken cancellationToken)
         {
-            if (_runningTask != null) return _runningTask;
+            if (_consumerTask != null)
+                return _consumerTask;
 
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(managerToken);
-            _runningTask = Task.Run(() => RunLoopAsync(_cts.Token), CancellationToken.None);
-            return _runningTask;
+            _stoppingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _consumerTask = RunLoopAsync(_stoppingCts.Token);
+
+            if (_consumerTask.IsCompleted)
+            {
+                return _consumerTask;
+            }
+
+            return Task.CompletedTask;
         }
 
-        // O manager chama StopAsync() para parar esse consumer
-        public async Task StopAsync()
+        public async Task StopAsync(CancellationToken cancellationToken)
         {
+            // Stop called without start
+            if (_consumerTask == null)
+            {
+                return;
+            }
+
             try
             {
-                if (_cts == null) return;
-                _cts.Cancel();
-                if (_runningTask != null) await _runningTask.ConfigureAwait(false);
+                // Signal cancellation to the executing method
+                _stoppingCts!.Cancel();
             }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
+            finally
             {
-                _logger.LogWarning(ex, "Erro ao parar consumer {Id}", _id);
+                // Wait until the task completes or the stop token triggers
+                var tcs = new TaskCompletionSource<object>();
+                using CancellationTokenRegistration registration = cancellationToken.Register(s => ((TaskCompletionSource<object>)s!).SetCanceled(), tcs);
+                // Do not await the _consumerTask because cancelling it will throw an OperationCanceledException which we are explicitly ignoring
+                await Task.WhenAny(_consumerTask, tcs.Task).ConfigureAwait(false);
             }
+        }
+
+        private Task<ConsumeResult<TKey, TValue>> ConsumeAsync(IConsumer<TKey, TValue> consumer)
+        {
+            var tcs = new TaskCompletionSource<ConsumeResult<TKey, TValue>>();
+            Task.Run(() =>
+            {
+                try
+                {
+                    var result = consumer.Consume(_batchTimeout);
+                    tcs.SetResult(result);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+            });
+            return tcs.Task;
+        }
+
+        private async Task<List<ConsumeResult<TKey, TValue>>> BatchConsumeAsync(IConsumer<TKey, TValue> consumer)
+        {
+            var consumerResults = new List<ConsumeResult<TKey, TValue>>();
+
+            for (int i = 0; i < _batchSize; i++)
+            {
+                try
+                {
+                    var result = await ConsumeAsync(consumer);
+
+                    if (!Actived)
+                        Actived = (result is not null) || !FirstConsumeFailed;
+
+                    if (result is null)
+                    {
+                        if (!Actived)
+                            _logger.LogWarning(_id, "[C{Id}] Consume not actived", _id);
+
+                        break;
+                    }
+
+                    consumerResults.Add(result);
+                }
+                catch (ConsumeException ex)
+                {
+                    if (!Actived && !FirstConsumeFailed)
+                    {
+                        FirstConsumeFailed = true;
+                        _logger.LogError(ex, "[C{Id}] First ConsumeException (will not retry)", _id);
+                    }
+                }
+            }
+
+            return consumerResults;
         }
 
         private async Task RunLoopAsync(CancellationToken ct)
@@ -76,59 +142,28 @@ namespace KafkaManagerConsumer
                 {
                     PartitionCount = partitions?.Count ?? 0;
                     LastPartitionAssigned = DateTime.UtcNow;
-                    _logger.LogDebug("[C{Id}] Partitions assigned: {Count}", _id, PartitionCount);
-                    //return partitions;
+                    _logger.LogInformation("[C{Id}] Partitions assigned: {Count}", _id, PartitionCount);                    
                 })
                 .SetPartitionsRevokedHandler((c, partitions) =>
                 {
                     PartitionCount = 0;
-                    _logger.LogDebug("[C{Id}] Partitions revoked", _id);
+                    _logger.LogInformation("[C{Id}] Partitions revoked", _id);
                 });
 
             using var consumer = builder.Build();
             consumer.Subscribe(_topic);
-
-            var buffer = new List<ConsumeResult<TKey, TValue>>(_batchSize);
-            DateTime? bufferFirstEnqueue = null;
-
+                        
             try
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    ConsumeResult<TKey, TValue>? result = null;
-                    try
-                    {
-                        // bloqueia até batchTimeout
-                        result = consumer.Consume(_batchTimeout);
-                    }
-                    catch (ConsumeException ex)
-                    {
-                        _logger.LogWarning(ex, "[C{Id}] ConsumeException", _id);
-                    }
+                   var consumerResults = await BatchConsumeAsync(consumer)
+                        .ConfigureAwait(false);
 
-                    if (result != null)
+                    if (!ct.IsCancellationRequested && consumerResults.Count > 0)
                     {
-                        buffer.Add(result);
-                        bufferFirstEnqueue ??= DateTime.UtcNow;
-                    }
-
-                    // flush by size
-                    if (buffer.Count >= _batchSize)
-                    {
-                        await DispatchBatch(buffer, ct).ConfigureAwait(false);
-                        bufferFirstEnqueue = null;
-                        buffer.Clear();
-                    }
-                    else if (buffer.Count > 0 && bufferFirstEnqueue.HasValue
-                             && DateTime.UtcNow - bufferFirstEnqueue.Value >= _batchTimeout)
-                    {
-                        // flush by timeout
-                        await DispatchBatch(buffer, ct).ConfigureAwait(false);
-                        bufferFirstEnqueue = null;
-                        buffer.Clear();
-                    }
-
-                    // continue loop
+                        await DispatchBatch(consumerResults, ct);
+                    }                    
                 }
             }
             catch (OperationCanceledException) { }

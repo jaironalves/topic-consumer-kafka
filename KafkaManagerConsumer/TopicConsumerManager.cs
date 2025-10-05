@@ -1,64 +1,59 @@
 ﻿using Confluent.Kafka;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using static Confluent.Kafka.ConfigPropertyNames;
 
 namespace KafkaManagerConsumer
 {
-    public class KafkaConsumerManager<TKey, TValue> : IKafkaConsumerManager<TKey, TValue>
+    public class TopicConsumerManager<TKey, TValue> : ITopicConsumerManager<TKey, TValue>
     {
+        private Task? _monitorTask;
+        private CancellationTokenSource? _stoppingCts;
+
         private readonly KafkaConsumerOptions<TKey, TValue> _options;
         private readonly IKafkaMessageHandler<TKey, TValue> _handler;
-        private readonly ILogger<KafkaConsumerManager<TKey, TValue>> _logger;
+        private readonly ILogger<TopicConsumerManager<TKey, TValue>> _logger;
 
         // lista de workers e suas Tasks
-        private readonly List<(KafkaBatchConsumer<TKey, TValue> Consumer, Task RunTask)> _workers =
+        private readonly List<(TopicConsumer<TKey, TValue> Consumer, Task RunTask)> _consumers =
             [];
 
         private CancellationTokenSource? _cts;
-        private Task? _monitorTask;
+        
         private int _idSeq = 0;
 
-        public KafkaConsumerManager(
+        public TopicConsumerManager(
             IOptions<KafkaConsumerOptions<TKey, TValue>> options,
             IKafkaMessageHandler<TKey, TValue> handler,
-            ILogger<KafkaConsumerManager<TKey, TValue>> logger)
+            ILogger<TopicConsumerManager<TKey, TValue>> logger)
         {
             _options = options.Value;
             _handler = handler;
             _logger = logger;
         }
 
-        public void Start()
-        {
-            if (_cts != null) throw new InvalidOperationException("Manager já iniciado");
+        public Task ExecuteAsync(CancellationToken cancellationToken)
+        {            
+            AddConsumer(cancellationToken);
+            return MonitorLoopAsync(cancellationToken);
 
-            _cts = new CancellationTokenSource();
-            // garante pelo menos 1 consumer inicial
-            AddConsumer();
             _monitorTask = Task.Run(() => MonitorLoopAsync(_cts.Token));
             _logger.LogInformation("KafkaConsumerManager iniciado para tópico {Topic}", _options.Topic);
         }
 
-        public async Task StopAsync()
+        public async Task StopAsync(CancellationToken cancellationToken)
         {
-            if (_cts == null) return;
-            _cts.Cancel();
+            //if (_cts == null) return;
+            //_cts.Cancel();
 
-            if (_monitorTask != null) await _monitorTask.ConfigureAwait(false);
+            //if (_monitorTask != null) await _monitorTask.ConfigureAwait(false);
 
             // stop all workers
-            var copy = _workers.ToList();
+            var copy = _consumers.ToList();
             foreach (var (consumer, runTask) in copy)
             {
                 try
                 {
-                    await consumer.StopAsync().ConfigureAwait(false);
+                    await consumer.StopAsync(cancellationToken).ConfigureAwait(false);
                     if (runTask != null) await runTask.ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -67,22 +62,22 @@ namespace KafkaManagerConsumer
                 }
             }
 
-            _workers.Clear();
+            _consumers.Clear();
             _cts = null;
             _logger.LogInformation("KafkaConsumerManager parado");
         }
 
-        private async Task MonitorLoopAsync(CancellationToken ct)
+        private async Task MonitorLoopAsync(CancellationToken cancellationToken)
         {
-            while (!ct.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 try
                 {
                     // total de partições atribuídas atualmente ao grupo (somatório dos workers)
-                    var totalAssignedPartitions = _workers.Sum(w => w.Consumer.PartitionCount);
-                    var totalWorkers = _workers.Count;
+                    var totalAssignedPartitions = _consumers.Sum(w => w.Consumer.PartitionCount);
+                    var totalWorkers = _consumers.Count;
 
-                    _logger.LogDebug("Manager status: workers={Workers}, assignedPartitions={Parts}",
+                    _logger.LogInformation("Manager status: workers={Workers}, assignedPartitions={Parts}",
                         totalWorkers, totalAssignedPartitions);
 
                     // Upscale: se o número de partições atribuídas for maior que o número de workers
@@ -90,16 +85,16 @@ namespace KafkaManagerConsumer
                     {
                         _logger.LogInformation("Upscale: partições ({Parts}) > workers ({Workers}) — adicionando consumer",
                             totalAssignedPartitions, totalWorkers);
-                        AddConsumer();
+                        AddConsumer(cancellationToken);
                     }
                     // Se ainda não houve atribuição (ex: totalAssignedPartitions == 0), podemos tentar esperar.
                     // Não criamos múltiplos consumers imediatamente — deixamos o loop decidir.
 
                     // Downscale: procurar worker sem partição e que esteja sem partição há mais que idleTimeout
-                    if (_workers.Count > 1)
+                    if (_consumers.Count > 1)
                     {
                         var now = DateTime.UtcNow;
-                        var idle = _workers.FirstOrDefault(w =>
+                        var idle = _consumers.FirstOrDefault(w =>
                             w.Consumer.PartitionCount == 0 &&
                             (now - w.Consumer.LastPartitionAssigned) > _options.IdleTimeout);
 
@@ -109,11 +104,11 @@ namespace KafkaManagerConsumer
                                 _options.IdleTimeout.TotalSeconds);
 
                             // para e aguarda sua finalização
-                            await idle.Consumer.StopAsync().ConfigureAwait(false);
+                            await idle.Consumer.StopAsync(cancellationToken).ConfigureAwait(false);
                             if (idle.RunTask != null) await idle.RunTask.ConfigureAwait(false);
 
-                            _workers.Remove(idle);
-                            _logger.LogInformation("Worker removido. Total agora: {Count}", _workers.Count);
+                            _consumers.Remove(idle);
+                            _logger.LogInformation("Worker removido. Total agora: {Count}", _consumers.Count);
                         }
                     }
                 }
@@ -122,11 +117,11 @@ namespace KafkaManagerConsumer
                     _logger.LogError(ex, "Erro no monitor loop do KafkaConsumerManager");
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(5), ct).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromSeconds(20), cancellationToken).ConfigureAwait(false);
             }
         }
 
-        private void AddConsumer()
+        private void AddConsumer(CancellationToken cancellationToken)
         {
             var id = Interlocked.Increment(ref _idSeq);
 
@@ -139,7 +134,7 @@ namespace KafkaManagerConsumer
             if (string.IsNullOrWhiteSpace(config.GroupId))
                 throw new InvalidOperationException("ConfigureBuilder deve definir GroupId no ConsumerConfig.");
 
-            var consumer = new KafkaBatchConsumer<TKey, TValue>(
+            var consumer = new TopicConsumer<TKey, TValue>(
                 id,
                 _options.Topic,
                 config,
@@ -148,9 +143,9 @@ namespace KafkaManagerConsumer
                 _options.BatchSize,
                 _options.BatchTimeout);
 
-            var runTask = consumer.StartAsync(_cts!.Token); // _cts sempre não-nulo aqui porque Start() cria
-            _workers.Add((consumer, runTask));
-            _logger.LogInformation("Adicionado novo worker id={Id}. Total workers: {Count}", id, _workers.Count);
+            var runTask = consumer.StartAsync(cancellationToken); // _cts sempre não-nulo aqui porque Start() cria
+            _consumers.Add((consumer, runTask));
+            _logger.LogInformation("Adicionado novo worker id={Id}. Total workers: {Count}", id, _consumers.Count);
         }
     }
 }
